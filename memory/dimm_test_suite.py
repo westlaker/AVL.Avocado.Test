@@ -653,7 +653,34 @@ class DIMMKernelTests(Test):
             self.log.info("Limited kernel memory info available (may need root access)")
             self.results['kernel_memory_info'] = {'status': 'limited_access'}
     
-    def tearDown(self):
+    
+    def test_06_ras_mce_scan(self):
+        """Scan for recent RAS / MCE / EDAC errors (best-effort).
+
+        This test is intentionally non-fatal by default: it records findings and warns.
+        """
+        self.log.info("Scanning dmesg for RAS/MCE/EDAC errors (best-effort)")
+        try:
+            # Only pull high-severity messages to reduce false positives
+            result = process.run("dmesg --level=err,crit,alert,emerg", shell=True, ignore_status=True)
+            out = (result.stdout_text or "") + "\n" + (result.stderr_text or "")
+            keywords = ["EDAC", "MCE", "Machine check", "RAS", "UE", "uncorrected", "corrected error"]
+            hits = []
+            for line in out.splitlines():
+                if any(k.lower() in line.lower() for k in keywords):
+                    hits.append(line.strip())
+            self.results["ras_mce_scan"] = {"hits": hits[:50], "hit_count": len(hits)}
+            if hits:
+                self.log.warning(f"Found {len(hits)} potential RAS/MCE/EDAC error lines in dmesg (showing up to 10):")
+                for l in hits[:10]:
+                    self.log.warning(f"  {l}")
+            else:
+                self.log.info("✓ No high-severity RAS/MCE/EDAC lines found in dmesg")
+        except Exception as e:
+            self.results["ras_mce_scan"] = {"status": "ERROR", "error": str(e)}
+            self.log.warning(f"Could not scan dmesg: {e}")
+
+def tearDown(self):
         """Cleanup and report results"""
         self.log.info(f"Kernel test results: {json.dumps(self.results, indent=2)}")
 
@@ -1278,7 +1305,24 @@ class DIMMBenchmarkTests(Test):
             else:
                 self.fail(f"Sustained stress failed: {e}")
     
-    def tearDown(self):
+    
+    def test_06_mbw_memory_bandwidth(self):
+        """Memory bandwidth microbenchmark via mbw (if available)."""
+        self.log.info("Running mbw memory bandwidth benchmark")
+        if not self.sm.check_installed("mbw"):
+            self.log.info("Installing mbw")
+            self.sm.install("mbw")
+
+        try:
+            # 1024 MiB test size; mbw prints bandwidth numbers
+            result = process.run("mbw -n 3 1024", shell=True, timeout=300, ignore_status=True)
+            self.results["mbw"] = {"status": "DONE", "output": (result.stdout_text or "").splitlines()[-20:]}
+            self.log.info("✓ mbw completed (see results for tail output)")
+        except Exception as e:
+            self.results["mbw"] = {"status": "FAIL", "error": str(e)}
+            self.fail(f"mbw benchmark failed: {e}")
+
+def tearDown(self):
         """Cleanup and report benchmark results"""
         self.log.info(f"Benchmark results: {json.dumps(self.results, indent=2)}")
         

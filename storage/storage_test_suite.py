@@ -37,6 +37,12 @@ from avocado.utils import process
 TEST_MODE = os.environ.get('TEST_MODE', 'quick').lower()
 TEST_DEVICE = os.environ.get('TEST_DEVICE', None)
 SPDK_PATH = os.environ.get('SPDK_PATH', '/usr/local/src/spdk')
+TEST_PCI_ADDR = os.environ.get('TEST_PCI_ADDR', None)
+# If set, enables potentially destructive operations (format/discard/write) beyond read-only
+TEST_DESTRUCTIVE = os.environ.get('TEST_DESTRUCTIVE', '0').lower() in ('1', 'true', 'yes')
+# Filesystem/app-level tests run under this directory (mount your target device here for best coverage)
+TEST_FS_DIR = os.environ.get('TEST_FS_DIR', '/var/tmp/avocado_storage_fs')
+
 
 # Test mode configurations
 TEST_CONFIGS = {
@@ -71,6 +77,16 @@ RUNNING_AS_ROOT = (os.geteuid() == 0)
 SUDO = not RUNNING_AS_ROOT
 
 CONFIG = TEST_CONFIGS.get(TEST_MODE, TEST_CONFIGS['quick'])
+
+PCI_BDF_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
+
+
+def is_pcie_bdf(value: str) -> bool:
+    return bool(value) and bool(PCI_BDF_RE.fullmatch(value.strip()))
+
+
+def normalize_pcie_bdf(value: str) -> str:
+    return value.strip().lower()
 
 import fcntl
 
@@ -214,28 +230,67 @@ class StorageDeviceManager:
         return None
 
     def check_device_safety(self, device):
-        """Check if device is safe to test"""
+        """Check if device is safe to test.
+
+        Notes:
+          - We treat *any* mounted partition on the device as unsafe.
+          - We treat the root filesystem device (including its parent disk) as unsafe.
+        """
         warnings = []
         is_safe = True
-        
+
+        dev = device
+
+        # 1) Mounted checks (device or any of its children partitions)
         try:
-            result = process.run(f"mount | grep {device}", shell=True, ignore_status=True)
-            if result.exit_status == 0:
-                warnings.append(f"Device is mounted")
-                is_safe = False
-        except:
-            pass
-        
+            # lsblk is more reliable than grepping mount output
+            result = process.run(f"lsblk -J -o NAME,TYPE,MOUNTPOINT,PKNAME {dev}", shell=True, ignore_status=True)
+            if result.exit_status == 0 and result.stdout_text.strip():
+                import json as _json
+                data = _json.loads(result.stdout_text)
+                # If any node in the subtree has a mountpoint, mark unsafe
+                def _walk(nodes):
+                    for n in nodes:
+                        yield n
+                        for c in n.get('children', []) or []:
+                            yield from _walk([c])
+                nodes = data.get('blockdevices', []) or []
+                for n in _walk(nodes):
+                    mp = n.get('mountpoint')
+                    if mp:
+                        warnings.append(f"Mounted: {n.get('name')} at {mp}")
+                        is_safe = False
+                        break
+        except Exception:
+            # Fallback: coarse check
+            try:
+                result = process.run(f"mount | grep -F '{dev}'", shell=True, ignore_status=True)
+                if result.exit_status == 0:
+                    warnings.append("Device appears mounted")
+                    is_safe = False
+            except Exception:
+                pass
+
+        # 2) Root filesystem check
         try:
-            result = process.run("df / | tail -1 | awk '{print $1}'", shell=True)
-            root_device = result.stdout_text.strip()
-            if device in root_device or root_device in device:
-                warnings.append("Device is root filesystem")
-                is_safe = False
-        except:
+            result = process.run("findmnt -no SOURCE /", shell=True, ignore_status=True)
+            root_source = (result.stdout_text or "").strip()
+            # root_source may be /dev/nvme2n1p2; consider its parent disk unsafe too
+            if root_source:
+                if dev == root_source or dev in root_source or root_source in dev:
+                    warnings.append("Device overlaps with root filesystem source")
+                    is_safe = False
+                else:
+                    # Parent disk of root_source
+                    parent = process.run(f"lsblk -no PKNAME {root_source}", shell=True, ignore_status=True).stdout_text.strip()
+                    if parent and os.path.basename(dev) == parent:
+                        warnings.append("Device is parent of root filesystem partition")
+                        is_safe = False
+        except Exception:
             pass
-        
+
         return is_safe, warnings
+
 
 
 class StorageKernelTests(Test):
@@ -659,31 +714,57 @@ class StorageUserspaceTests(Test):
         except Exception as e:
             self.log.debug(f"Could not check hugepages: {e}")
         
-        # Get device information
+                # Get device information / target selection (SPDK needs a stable identifier)
+        self.test_device = None
+        self.pcie_addr = None
+
+        # Prefer explicit PCIe address override (most stable for SPDK)
+        if TEST_PCI_ADDR and is_pcie_bdf(TEST_PCI_ADDR):
+            self.pcie_addr = normalize_pcie_bdf(TEST_PCI_ADDR)
+
+        # TEST_DEVICE can be either /dev/nvmeXnY (recommended) or a PCI BDF for SPDK
         if TEST_DEVICE:
-            self.test_device = TEST_DEVICE
-        else:
-            devices = self.dev_mgr.discover_nvme_devices()
-            if not devices:
-                self.cancel("No NVMe devices found")
-                self.test_device = devices[0]
+            if is_pcie_bdf(TEST_DEVICE):
+                self.pcie_addr = normalize_pcie_bdf(TEST_DEVICE)
+            else:
+                self.test_device = TEST_DEVICE
 
-        # Cache PCIe address per test_device so later SPDK tests won't cancel if sysfs is transient
-        cache_path = f"/tmp/spdk_pcie_addr.{os.path.basename(self.test_device)}"
+        # For safety: never auto-pick a device for SPDK (setup.sh can affect multiple devices)
+        if not self.test_device and not self.pcie_addr:
+            self.cancel("SPDK tests require explicit target: set TEST_DEVICE=/dev/nvmeXnY or TEST_PCI_ADDR=dddd:bb:dd.f")
 
-        self.pcie_addr = self.dev_mgr.get_pcie_address(self.test_device)
+        # If we only have PCIe BDF, try to map it back to a local /dev node (best-effort for logging/safety)
+        if self.pcie_addr and not self.test_device:
+            try:
+                for dev in self.dev_mgr.discover_nvme_devices():
+                    bdf = self.dev_mgr.get_pcie_address(dev)
+                    if bdf and bdf.lower() == self.pcie_addr:
+                        self.test_device = dev
+                        break
+            except Exception:
+                pass
+
+        # If we only have /dev node, derive PCIe BDF
+        if self.test_device and not self.pcie_addr:
+            self.pcie_addr = self.dev_mgr.get_pcie_address(self.test_device)
+
+        # Cache PCIe address so transient sysfs issues don't cancel later tests
+        cache_key = os.path.basename(self.test_device) if self.test_device else (self.pcie_addr or "unknown")
+        cache_key_safe = re.sub(r'[^0-9a-zA-Z_.-]+', '_', cache_key)
+        cache_path = f"/tmp/spdk_pcie_addr.{cache_key_safe}"
+
         if not self.pcie_addr and os.path.exists(cache_path):
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cached = f.read().strip()
-                if cached:
-                    self.pcie_addr = cached
-                    self.log.info(f"Using cached PCIe address {self.pcie_addr} for {self.test_device}")
+                if cached and is_pcie_bdf(cached):
+                    self.pcie_addr = normalize_pcie_bdf(cached)
+                    self.log.info(f"Using cached PCIe address {self.pcie_addr} for {cache_key}")
             except Exception:
                 pass
 
         if not self.pcie_addr:
-            self.log.info(f"Could not determine PCIe address for {self.test_device}")
+            self.log.info(f"Could not determine PCIe address for {self.test_device or TEST_DEVICE}")
             self.log.info("Try finding it manually:")
             self.log.info("  lspci -Dnn | grep -Ei 'non-volatile|nvme|0108'")
             self.cancel("Could not determine PCIe address")
@@ -695,10 +776,12 @@ class StorageUserspaceTests(Test):
         except Exception:
             pass
 
-        self.log.info(f"Testing device: {self.test_device}")
+        dev_label = self.test_device if self.test_device else f"PCIe {self.pcie_addr}"
+        self.log.info(f"Testing target: {dev_label}")
         self.log.info(f"PCIe address: {self.pcie_addr}")
-        
-        self._lock_fd = acquire_device_lock(self.log, self.test_device)
+
+        # Take a coarse device lock to avoid multiple SPDK tests racing setup.sh
+        self._lock_fd = acquire_device_lock(self.log, self.test_device or self.pcie_addr)
         #spdk_reset_if_available(self.log)   # ensure vfio didn’t steal the device
         # Setup SPDK (bind device to UIO/VFIO)
         self.log.info("")
@@ -915,6 +998,13 @@ class StorageUserspaceTests(Test):
         except Exception as e:
             self.log.debug(f"SPDK cleanup note: {e}")
         
+        # Release device lock if held
+        try:
+            if hasattr(self, "_lock_fd") and self._lock_fd:
+                release_device_lock(self.log, self._lock_fd)
+        except Exception:
+            pass
+
         self.log.info(f"Userspace test results: {json.dumps(self.results, indent=2)}")
 
 class StorageDatacenterTests(Test):
@@ -1251,3 +1341,150 @@ class StorageBenchmarkTests(Test):
                 'timestamp': time.time()
             }, f, indent=2)
         self.log.info(f"✓ Results saved to {results_file}")
+
+
+class StorageFilesystemTests(Test):
+    """Filesystem-level storage tests (non-raw).
+
+    For best coverage, mount the target storage device at TEST_FS_DIR (or set TEST_FS_DIR accordingly)
+    before running these tests.
+    """
+
+    def setUp(self):
+        self.log.info("=== Storage Filesystem Tests ===")
+        self.results = {}
+        self.sm = SoftwareManager()
+        self.fs_dir = TEST_FS_DIR
+
+        # Ensure directory exists
+        try:
+            os.makedirs(self.fs_dir, exist_ok=True)
+        except Exception as e:
+            self.cancel(f"Could not create TEST_FS_DIR={self.fs_dir}: {e}")
+
+        # Optional tools
+        for tool in ["fio", "stress-ng"]:
+            if not self.sm.check_installed(tool):
+                self.log.info(f"Installing {tool}")
+                self.sm.install(tool)
+
+    def test_01_fio_file_integrity_verify(self):
+        """Write+read verify on a test file (CRC verify)."""
+        self.log.info("Running fio file verify (CRC)")
+        testfile = os.path.join(self.fs_dir, "fio_verify.dat")
+
+        runtime = CONFIG.get("fio_runtime", 60)
+        size = "4G" if TEST_MODE != "quick" else "1G"
+
+        fio_cmd = f"""fio --name=verify --filename={testfile} --direct=1 \
+            --rw=randwrite --bs=4k --ioengine=libaio --iodepth=32 \
+            --size={size} --runtime={runtime} --time_based --numjobs=1 \
+            --verify=crc32c --do_verify=1 --verify_fatal=1 --group_reporting \
+            --output-format=json"""
+
+        try:
+            result = process.run(fio_cmd, sudo=SUDO, shell=True, timeout=runtime + 120)
+            fio_output = json.loads(result.stdout_text)
+            errors = fio_output["jobs"][0].get("error", 0)
+            self.results["fio_file_verify"] = {"status": "PASS" if errors == 0 else "FAIL", "errors": errors, "file": testfile}
+            if errors != 0:
+                self.fail(f"fio verify reported errors: {errors}")
+            self.log.info("✓ fio file verify passed")
+        except Exception as e:
+            self.results["fio_file_verify"] = "FAIL"
+            self.fail(f"fio file verify failed: {e}")
+
+    def test_02_filesystem_metadata_stress(self):
+        """Metadata stress (best-effort): fsstress if available, else stress-ng iomix."""
+        self.log.info("Running filesystem metadata stress (best-effort)")
+        duration = 120 if TEST_MODE == "quick" else 600
+        fsstress = "fsstress"
+        try:
+            which = process.run(f"which {fsstress}", shell=True, ignore_status=True)
+            if which.exit_status == 0:
+                cmd = f"""{fsstress} -d {self.fs_dir} -n 5000 -p 10 -f range=0,1024"""
+                process.run(cmd, shell=True, timeout=duration + 60, ignore_status=True)
+                self.results["fsstress"] = {"status": "DONE", "tool": "fsstress", "dir": self.fs_dir}
+                self.log.info("✓ fsstress completed")
+                return
+        except Exception:
+            pass
+
+        # Fallback to stress-ng iomix
+        try:
+            cmd = f"""stress-ng --iomix 1 --iomix-bytes 1G --timeout {duration}s --temp-path {self.fs_dir} --metrics-brief"""
+            process.run(cmd, shell=True, timeout=duration + 60, ignore_status=True)
+            self.results["fsstress"] = {"status": "DONE", "tool": "stress-ng iomix", "dir": self.fs_dir}
+            self.log.info("✓ stress-ng iomix completed")
+        except Exception as e:
+            self.results["fsstress"] = "FAIL"
+            self.fail(f"Filesystem stress failed: {e}")
+
+    def tearDown(self):
+        self.log.info(f"Filesystem test results: {json.dumps(self.results, indent=2)}")
+
+
+class StorageApplicationTests(Test):
+    """Lightweight application-level tests (DB-like)."""
+
+    def setUp(self):
+        self.log.info("=== Storage Application Tests ===")
+        self.results = {}
+        self.fs_dir = TEST_FS_DIR
+        try:
+            os.makedirs(self.fs_dir, exist_ok=True)
+        except Exception as e:
+            self.cancel(f"Could not create TEST_FS_DIR={self.fs_dir}: {e}")
+
+    def test_01_sqlite_insert_select(self):
+        """SQLite insert/select workload on TEST_FS_DIR."""
+        import sqlite3
+        import time as _time
+
+        db_path = os.path.join(self.fs_dir, "app_sqlite.db")
+        if os.path.exists(db_path):
+            try:
+                os.remove(db_path)
+            except Exception:
+                pass
+
+        n_rows = 20000 if TEST_MODE == "quick" else (200000 if TEST_MODE == "normal" else 500000)
+        self.log.info(f"SQLite workload: {n_rows} rows at {db_path}")
+
+        t0 = _time.time()
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=FULL;")
+        cur.execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT);")
+
+        try:
+            cur.execute("BEGIN;")
+            for i in range(n_rows):
+                cur.execute("INSERT INTO t(k, v) VALUES(?, ?);", (i, "x" * 200))
+            conn.commit()
+
+            t1 = _time.time()
+            cur.execute("SELECT COUNT(*) FROM t;")
+            count = cur.fetchone()[0]
+            t2 = _time.time()
+
+            if count != n_rows:
+                self.results["sqlite"] = {"status": "FAIL", "count": count, "expected": n_rows}
+                self.fail(f"SQLite count mismatch: got {count}, expected {n_rows}")
+
+            ins_rate = n_rows / max(1e-6, (t1 - t0))
+            sel_rate = 1 / max(1e-6, (t2 - t1))
+            self.results["sqlite"] = {
+                "status": "PASS",
+                "rows": n_rows,
+                "insert_rows_per_sec": ins_rate,
+                "select_ops_per_sec": sel_rate,
+                "db_path": db_path,
+            }
+            self.log.info(f"✓ SQLite insert rate: {ins_rate:.0f} rows/s, select: {sel_rate:.2f} ops/s")
+        finally:
+            conn.close()
+
+    def tearDown(self):
+        self.log.info(f"Application test results: {json.dumps(self.results, indent=2)}")
