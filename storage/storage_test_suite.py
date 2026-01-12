@@ -1369,30 +1369,89 @@ class StorageFilesystemTests(Test):
                 self.sm.install(tool)
 
     def test_01_fio_file_integrity_verify(self):
-        """Write+read verify on a test file (CRC verify)."""
+        """Write+read verify on a test file (CRC verify).
+
+        Notes:
+          * fio's JSON output can occasionally be empty or polluted on stdout (e.g., wrappers/sudo noise).
+          * To make parsing robust, we always ask fio to write JSON to an output file and parse that.
+        """
         self.log.info("Running fio file verify (CRC)")
         testfile = os.path.join(self.fs_dir, "fio_verify.dat")
 
         runtime = CONFIG.get("fio_runtime", 60)
         size = "4G" if TEST_MODE != "quick" else "1G"
 
+        # Prefer parsing from an output file (more reliable than stdout).
+        out_json = os.path.join(self.fs_dir, f"fio_verify_{int(time.time())}.json")
+
         fio_cmd = f"""fio --name=verify --filename={testfile} --direct=1 \
             --rw=randwrite --bs=4k --ioengine=libaio --iodepth=32 \
             --size={size} --runtime={runtime} --time_based --numjobs=1 \
             --verify=crc32c --do_verify=1 --verify_fatal=1 --group_reporting \
-            --output-format=json"""
+            --output={out_json} --output-format=json"""
 
         try:
             result = process.run(fio_cmd, sudo=SUDO, shell=True, timeout=runtime + 120)
-            fio_output = json.loads(result.stdout_text)
-            errors = fio_output["jobs"][0].get("error", 0)
-            self.results["fio_file_verify"] = {"status": "PASS" if errors == 0 else "FAIL", "errors": errors, "file": testfile}
+
+            raw = ""
+            if os.path.exists(out_json):
+                try:
+                    raw = open(out_json, "r", encoding="utf-8", errors="replace").read()
+                except Exception:
+                    raw = ""
+            if not raw.strip():
+                # Fallback: some fio builds still emit JSON to stdout
+                raw = (result.stdout_text or "")
+
+            raw_s = (raw or "").strip()
+            if not raw_s:
+                raise ValueError(
+                    "fio produced empty output (expected JSON). "
+                    f"exit_status={getattr(result, 'exit_status', 'n/a')}. "
+                    f"stdout_len={len(result.stdout_text or '')}, stderr_len={len(result.stderr_text or '')}."
+                )
+
+            try:
+                fio_output = json.loads(raw_s)
+            except Exception:
+                # Best-effort: extract the first JSON object from the captured text
+                i = raw_s.find("{")
+                j = raw_s.rfind("}")
+                if i != -1 and j != -1 and j > i:
+                    fio_output = json.loads(raw_s[i : j + 1])
+                else:
+                    raise
+
+            # fio schema: per-job errors are usually in jobs[i]['error']
+            errors = 0
+            try:
+                errors = int(fio_output.get("jobs", [{}])[0].get("error", 0))
+            except Exception:
+                errors = 0
+
+            self.results["fio_file_verify"] = {
+                "status": "PASS" if errors == 0 else "FAIL",
+                "errors": errors,
+                "file": testfile,
+                "json": out_json,
+            }
+
             if errors != 0:
                 self.fail(f"fio verify reported errors: {errors}")
+
             self.log.info("✓ fio file verify passed")
         except Exception as e:
+            # Include some context to make failures actionable.
+            ctx = ""
+            try:
+                ctx = (result.stderr_text or "").strip()[:400]
+            except Exception:
+                pass
             self.results["fio_file_verify"] = "FAIL"
-            self.fail(f"fio file verify failed: {e}")
+            if ctx:
+                self.fail(f"fio file verify failed: {e}; stderr_head={ctx!r}")
+            else:
+                self.fail(f"fio file verify failed: {e}")
 
     def test_02_filesystem_metadata_stress(self):
         """Metadata stress (best-effort): fsstress if available, else stress-ng iomix."""

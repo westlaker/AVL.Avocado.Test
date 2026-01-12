@@ -112,7 +112,28 @@ Run Specific Storage Test:
  TEST_DEVICE=/dev/nvme0n1
  sudo -E /home/ubuntu/venv-avocado/bin/avocado run --max-parallel-tasks=1   storage_test_suite.py:StorageBenchmarkTests.test_03_sustained_performance
 ```
+Report the Test Results
 
+Example usage
+
+```text
+1) Generate reports from the last 10 jobs
+python3 avocado_report.py --jobs 10 --out-dir ./final_reports
+
+2) Point at a specific job-results root
+python3 avocado_report.py --job-root /home/ubuntu/avocado/job-results --out-dir ./final_reports
+```
+
+Output files
+
+```text
+final_reports/storage_report.csv
+final_reports/storage_report.txt
+final_reports/storage_report.pdf (if reportlab installed)
+final_reports/memory_report.csv
+final_reports/memory_report.txt
+final_reports/memory_report.pdf
+```
 
 
 ```
