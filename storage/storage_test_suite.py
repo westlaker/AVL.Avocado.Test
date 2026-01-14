@@ -24,6 +24,7 @@ Usage:
 """
 
 import os
+from pathlib import Path
 import sys
 import time
 import json
@@ -35,6 +36,10 @@ from avocado.utils import process
 
 # Get configuration from environment
 TEST_MODE = os.environ.get('TEST_MODE', 'quick').lower()
+
+# Backward-compatible alias: some users expect TEST_MODE=stress
+if TEST_MODE == 'stress':
+    TEST_MODE = 'full'
 TEST_DEVICE = os.environ.get('TEST_DEVICE', None)
 SPDK_PATH = os.environ.get('SPDK_PATH', '/usr/local/src/spdk')
 TEST_PCI_ADDR = os.environ.get('TEST_PCI_ADDR', None)
@@ -78,6 +83,11 @@ SUDO = not RUNNING_AS_ROOT
 
 CONFIG = TEST_CONFIGS.get(TEST_MODE, TEST_CONFIGS['quick'])
 
+
+# Allow env overrides without editing the file
+IO_SIZE_GB = int(os.getenv('IO_SIZE_GB', CONFIG.get('io_size_gb', 10)))
+FULL_DISK_PASSES = int(os.getenv('FULL_DISK_PASSES', CONFIG.get('full_disk_passes', 1)))
+FIO_RUNTIME = int(os.getenv('FIO_RUNTIME', CONFIG.get('fio_runtime', 60)))
 PCI_BDF_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
 
 
@@ -151,29 +161,88 @@ class StorageDeviceManager:
         self.log = log
     
     def discover_nvme_devices(self):
-        """Discover all NVMe devices"""
+        """Discover NVMe disk devices suitable for testing."""
         nvme_devices = []
         try:
             result = process.run("lsblk -d -n -o NAME,TYPE", shell=True)
-            for line in result.stdout_text.split('\n'):
+            for line in (result.stdout_text or "").splitlines():
                 parts = line.split()
-                if parts and parts[0].startswith('nvme'):
-                    device = f"/dev/{parts[0]}"
-                    nvme_devices.append(device)
-                    self.log.info(f"Found NVMe device: {device}")
+                if len(parts) < 2:
+                    continue
+                name, typ = parts[0], parts[1]
+                if not name.startswith("nvme") or typ != "disk":
+                    continue
+                dev = f"/dev/{name}"
+                if self.device_looks_valid(dev):
+                    nvme_devices.append(dev)
+                    self.log.info(f"Found NVMe device: {dev} (size={self.get_device_size_gb(dev):.1f} GiB)")
+                else:
+                    self.log.info(f"Skipping NVMe candidate (invalid): {dev}")
         except Exception as e:
-            self.log.debug(f"Could not discover devices: {e}")
+            self.log.info(f"NVMe discovery failed: {e}")
         return nvme_devices
-    
-    def get_device_size_gb(self, device):
-        """Get device size in GB"""
+    def _is_block_device(self, device):
+        try:
+            import stat
+            st = os.stat(device)
+            return stat.S_ISBLK(st.st_mode)
+        except Exception:
+            return False
+
+    def _sysfs_block_path(self, device):
+        return Path("/sys/class/block") / os.path.basename(device)
+
+    def get_device_size_bytes(self, device):
+        """Get device size in bytes. Returns 0 on failure."""
+        # 1) blockdev
         try:
             result = process.run(f"blockdev --getsize64 {device}", sudo=SUDO)
-            size_bytes = int(result.stdout_text.strip())
-            return size_bytes / (1024**3)
-        except:
-            return 0
-    
+            out = (result.stdout_text or "").strip()
+            if out:
+                return int(out)
+        except Exception:
+            pass
+
+        # 2) lsblk
+        try:
+            result = process.run(f"lsblk -b -n -d -o SIZE {device}", shell=True, sudo=SUDO)
+            out = (result.stdout_text or "").strip()
+            if out:
+                return int(out.splitlines()[0].strip())
+        except Exception:
+            pass
+
+        # 3) sysfs sectors * 512
+        try:
+            size_path = self._sysfs_block_path(device) / "size"
+            if size_path.exists():
+                sectors = int(size_path.read_text().strip())
+                return sectors * 512
+        except Exception:
+            pass
+
+        return 0
+
+    def get_device_size_gb(self, device):
+        """Get device size in GiB. Returns 0.0 on failure."""
+        size_bytes = self.get_device_size_bytes(device)
+        return size_bytes / (1024**3) if size_bytes > 0 else 0.0
+
+    def device_looks_valid(self, device):
+        """Sanity: exists, is block device, has sysfs node, and size > 0."""
+        if not device or not os.path.exists(device):
+            return False
+        if not self._is_block_device(device):
+            try:
+                self.log.info(f"Device path exists but is not a block device: {device} (mode={oct(os.stat(device).st_mode)})")
+            except Exception:
+                pass
+            return False
+        if not self._sysfs_block_path(device).exists():
+            return False
+        if self.get_device_size_bytes(device) <= 0:
+            return False
+        return True
     def _get_pcie_address(self, device):
         """Get PCIe address for NVMe device (needed for SPDK)"""
         try:
@@ -322,6 +391,17 @@ class StorageKernelTests(Test):
             self.test_device = devices[0]
         
         self.log.info(f"Testing device: {self.test_device}")
+        if not self.dev_mgr.device_looks_valid(self.test_device):
+            self.log.info(f"⚠️  Device '{self.test_device}' is not valid for testing (no sysfs node or size=0).")
+            self.log.info("    This can happen after SPDK bind/unbind renumbers /dev/nvmeXnY.")
+            self.log.info("    Use a persistent path like /dev/disk/by-id/nvme-* or /dev/disk/by-path/*.")
+            if TEST_DEVICE:
+                self.cancel(f"TEST_DEVICE invalid or size unknown: {self.test_device}")
+            devices = self.dev_mgr.discover_nvme_devices()
+            if not devices:
+                self.cancel("No valid NVMe devices found")
+            self.log.info(f"Falling back to: {devices[0]}")
+            self.test_device = devices[0]
         self.device_size_gb = self.dev_mgr.get_device_size_gb(self.test_device)
         self.log.info(f"Device size: {self.device_size_gb:.1f} GB")
         
@@ -336,10 +416,12 @@ class StorageKernelTests(Test):
         """Full disk sequential write test - tests entire capacity"""
         self.log.info("Running FULL DISK sequential write test")
         
-        num_passes = CONFIG['full_disk_passes']
+        num_passes = FULL_DISK_PASSES
         total_size_gb = int(self.device_size_gb * 0.95)  # Use 95% of disk
         if TEST_MODE == 'quick':
-            total_size_gb = min(total_size_gb, CONFIG['io_size_gb'])
+            total_size_gb = min(total_size_gb, IO_SIZE_GB)
+        if total_size_gb <= 0:
+            self.cancel(f"Device size unknown (device_size_gb={self.device_size_gb}). Refusing to run with --size=0G")
 
         self.log.info(f"Will write {total_size_gb}GB across {num_passes} pass(es)")
         
@@ -349,7 +431,7 @@ class StorageKernelTests(Test):
             self.log.info(f"=== Pass {pass_num + 1}/{num_passes} ===")
             
             fio_cmd = f"""fio --name=full_seq_write_p{pass_num} \
-                --filename={self.test_device} --direct=1 \
+                --filename={self.test_device} --allow_file_create=0 --direct=1 \
                 --rw=write --bs=1m --ioengine=libaio --iodepth=64 \
                 --size={total_size_gb}G --numjobs=1 \
                 --output-format=json"""
@@ -392,10 +474,10 @@ class StorageKernelTests(Test):
         
         total_size_gb = int(self.device_size_gb * 0.95)
         if TEST_MODE == 'quick':
-            total_size_gb = min(total_size_gb, CONFIG['io_size_gb'])
+            total_size_gb = min(total_size_gb, IO_SIZE_GB)
         
         fio_cmd = f"""fio --name=full_seq_read \
-            --filename={self.test_device} --direct=1 \
+            --filename={self.test_device} --allow_file_create=0 --direct=1 \
             --rw=read --bs=1m --ioengine=libaio --iodepth=64 \
             --size={total_size_gb}G --numjobs=1 \
             --output-format=json"""
@@ -429,9 +511,9 @@ class StorageKernelTests(Test):
             self.log.info(f"Testing block size: {bs}")
             
             fio_cmd = f"""fio --name=bs_read_{bs} \
-                --filename={self.test_device} --direct=1 \
+                --filename={self.test_device} --allow_file_create=0 --direct=1 \
                 --rw=read --bs={bs} --ioengine=libaio --iodepth=32 \
-                --size={CONFIG['io_size_gb']}G --numjobs=1 \
+                --size={IO_SIZE_GB}G --numjobs=1 \
                 --output-format=json"""
             
             try:
@@ -465,9 +547,9 @@ class StorageKernelTests(Test):
             self.log.info(f"Testing block size: {bs}")
             
             fio_cmd = f"""fio --name=bs_write_{bs} \
-                --filename={self.test_device} --direct=1 \
+                --filename={self.test_device} --allow_file_create=0 --direct=1 \
                 --rw=write --bs={bs} --ioengine=libaio --iodepth=32 \
-                --size={CONFIG['io_size_gb']}G --numjobs=1 \
+                --size={IO_SIZE_GB}G --numjobs=1 \
                 --output-format=json"""
             
             try:
@@ -501,14 +583,14 @@ class StorageKernelTests(Test):
             self.log.info(f"Random read {bs}")
             
             fio_cmd = f"""fio --name=randread_{bs} \
-                --filename={self.test_device} --direct=1 \
+                --filename={self.test_device} --allow_file_create=0 --direct=1 \
                 --rw=randread --bs={bs} --ioengine=libaio --iodepth=128 \
-                --runtime={CONFIG['fio_runtime']} --numjobs=4 \
+                --runtime={FIO_RUNTIME} --numjobs=4 \
                 --time_based --group_reporting --output-format=json"""
             
             try:
                 result = process.run(fio_cmd, sudo=SUDO, shell=True, 
-                                   timeout=CONFIG['fio_runtime'] + 60)
+                                   timeout=FIO_RUNTIME + 60)
                 fio_output = json.loads(result.stdout_text)
                 
                 iops = fio_output['jobs'][0]['read']['iops']
@@ -540,14 +622,14 @@ class StorageKernelTests(Test):
             self.log.info(f"Random write {bs}")
             
             fio_cmd = f"""fio --name=randwrite_{bs} \
-                --filename={self.test_device} --direct=1 \
+                --filename={self.test_device} --allow_file_create=0 --direct=1 \
                 --rw=randwrite --bs={bs} --ioengine=libaio --iodepth=128 \
-                --runtime={CONFIG['fio_runtime']} --numjobs=4 \
+                --runtime={FIO_RUNTIME} --numjobs=4 \
                 --time_based --group_reporting --output-format=json"""
             
             try:
                 result = process.run(fio_cmd, sudo=SUDO, shell=True, 
-                                   timeout=CONFIG['fio_runtime'] + 60)
+                                   timeout=FIO_RUNTIME + 60)
                 fio_output = json.loads(result.stdout_text)
                 
                 iops = fio_output['jobs'][0]['write']['iops']
@@ -857,7 +939,7 @@ class StorageUserspaceTests(Test):
         """SPDK userspace sequential read"""
         self.log.info("Running SPDK sequential read test")
         
-        runtime = CONFIG['fio_runtime']
+        runtime = FIO_RUNTIME
         
         # Set up environment with SPDK library paths
         env = os.environ.copy()
@@ -899,7 +981,7 @@ class StorageUserspaceTests(Test):
         """SPDK userspace random 4K read"""
         self.log.info("Running SPDK random 4K read")
         
-        runtime = CONFIG['fio_runtime']
+        runtime = FIO_RUNTIME
         
         # Set up environment with SPDK library paths
         env = os.environ.copy()
@@ -1036,9 +1118,9 @@ class StorageDatacenterTests(Test):
         """OLTP database workload (80/20 read/write mix)"""
         self.log.info("Running OLTP database workload")
         
-        runtime = CONFIG['fio_runtime']
+        runtime = FIO_RUNTIME
         
-        fio_cmd = f"""fio --name=oltp --filename={self.test_device} --direct=1 \
+        fio_cmd = f"""fio --name=oltp --filename={self.test_device} --allow_file_create=0 --direct=1 \
             --rw=randrw --rwmixread=80 --bs=8k --ioengine=libaio --iodepth=128 \
             --runtime={runtime} --numjobs=8 --time_based --group_reporting \
             --output-format=json"""
@@ -1084,9 +1166,9 @@ class StorageDatacenterTests(Test):
         """Log/streaming write workload"""
         self.log.info("Running log streaming workload")
         
-        runtime = CONFIG['fio_runtime']
+        runtime = FIO_RUNTIME
         
-        fio_cmd = f"""fio --name=streaming --filename={self.test_device} --direct=1 \
+        fio_cmd = f"""fio --name=streaming --filename={self.test_device} --allow_file_create=0 --direct=1 \
             --rw=write --bs=1m --ioengine=libaio --iodepth=16 \
             --runtime={runtime} --numjobs=4 --time_based --group_reporting \
             --output-format=json"""
@@ -1112,9 +1194,9 @@ class StorageDatacenterTests(Test):
         """Mixed workload (50/50 read/write)"""
         self.log.info("Running mixed 50/50 workload")
         
-        runtime = CONFIG['fio_runtime']
+        runtime = FIO_RUNTIME
         
-        fio_cmd = f"""fio --name=mixed --filename={self.test_device} --direct=1 \
+        fio_cmd = f"""fio --name=mixed --filename={self.test_device} --allow_file_create=0 --direct=1 \
             --rw=randrw --rwmixread=50 --bs=4k --ioengine=libaio --iodepth=64 \
             --runtime={runtime} --numjobs=8 --time_based --group_reporting \
             --output-format=json"""
@@ -1180,7 +1262,7 @@ class StorageBenchmarkTests(Test):
         for qd in queue_depths:
             self.log.info(f"Testing QD={qd}")
             
-            fio_cmd = f"""fio --name=qd{qd} --filename={self.test_device} --direct=1 \
+            fio_cmd = f"""fio --name=qd{qd} --filename={self.test_device} --allow_file_create=0 --direct=1 \
                 --rw=randread --bs=4k --ioengine=libaio --iodepth={qd} \
                 --runtime={runtime} --numjobs=1 --time_based --group_reporting \
                 --output-format=json"""
@@ -1211,9 +1293,9 @@ class StorageBenchmarkTests(Test):
         """Detailed latency distribution"""
         self.log.info("Measuring latency percentiles")
         
-        runtime = CONFIG['fio_runtime']
+        runtime = FIO_RUNTIME
         
-        fio_cmd = f"""fio --name=latency --filename={self.test_device} --direct=1 \
+        fio_cmd = f"""fio --name=latency --filename={self.test_device} --allow_file_create=0 --direct=1 \
             --rw=randread --bs=4k --ioengine=libaio --iodepth=32 \
             --runtime={runtime} --numjobs=1 --time_based --group_reporting \
             --output-format=json"""
@@ -1296,9 +1378,9 @@ class StorageBenchmarkTests(Test):
         self.log.info("Running sustained performance test")
         
         # Use io_size_gb instead of duration_sec for this test
-        size_gb = CONFIG['io_size_gb']
+        size_gb = IO_SIZE_GB
         
-        fio_cmd = f"""fio --name=sustained --filename={self.test_device} --direct=1 \
+        fio_cmd = f"""fio --name=sustained --filename={self.test_device} --allow_file_create=0 --direct=1 \
             --rw=write --bs=128k --ioengine=libaio --iodepth=32 \
             --size={size_gb}G --numjobs=1 \
             --output-format=json"""

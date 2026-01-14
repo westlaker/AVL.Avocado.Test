@@ -30,6 +30,9 @@ Memory Tests:
 List All Memory Tests
 ```text
  cd memory
+ export TEST_DEVICE=/dev/nvme0n1
+ # to have full disk test (95% coverage)
+ export TEST_MODE=full
  sudo -E /home/ubuntu/venv-avocado/bin/avocado run dimm_test_suite.py
  Type                 Test                                                                    Uri                                                                     Resolver             Tag(s)
  avocado-instrumented dimm_test_suite.py:DIMMKernelTests.test_01_memtest_safe_region          dimm_test_suite.py:DIMMKernelTests.test_01_memtest_safe_region          avocado-instrumented
@@ -59,12 +62,16 @@ List All Memory Tests
 Run All Memory Tests:
 ```text
  cd memory
+ # to have full disk test (95% coverage)
+ export TEST_MODE=full
  sudo -E /home/ubuntu/venv-avocado/bin/avocado run --max-parallel-tasks=1 dimm_test_suite.py
 ```
 
 Run Specific Memory Test:
 ```text
  cd memory
+ # to have full disk test (95% coverage)
+ export TEST_MODE=full
  sudo -E /home/ubuntu/venv-avocado/bin/avocado run --max-parallel-tasks=1  dimm_test_suite.py:DIMMBenchmarkTests.test_04_memory_stress_sustained 
 ```
 
@@ -73,6 +80,9 @@ Storage Tests:
 List Storage Tests:
 ```text
  cd storage
+ export TEST_DEVICE=/dev/nvme0n1
+ # to have full disk test (95% coverage)
+ export TEST_MODE=full
  sudo -E /home/ubuntu/venv-avocado/bin/avocado -V list  storage_test_suite.py
  Type                 Test                                                                        Uri                                                                         Resolver             Tag(s)
  avocado-instrumented storage_test_suite.py:StorageKernelTests.test_01_full_disk_sequential_write storage_test_suite.py:StorageKernelTests.test_01_full_disk_sequential_write avocado-instrumented
@@ -102,14 +112,18 @@ List Storage Tests:
 Run All Storage Tests:
 ```text
  cd storage
- TEST_DEVICE=/dev/nvme0n1
+ export TEST_DEVICE=/dev/nvme0n1
+ # to have full disk test (95% coverage)
+ export TEST_MODE=full
  sudo -E /home/ubuntu/venv-avocado/bin/avocado run --max-parallel-tasks=1   storage_test_suite.py
 ```
 
 Run Specific Storage Test:
 ```text
  cd storage
- TEST_DEVICE=/dev/nvme0n1
+ export TEST_DEVICE=/dev/nvme0n1
+ # to have full disk test (95% coverage)
+ export TEST_MODE=full
  sudo -E /home/ubuntu/venv-avocado/bin/avocado run --max-parallel-tasks=1   storage_test_suite.py:StorageBenchmarkTests.test_03_sustained_performance
 ```
 Report the Test Results
