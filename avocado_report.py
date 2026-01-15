@@ -1,404 +1,653 @@
 #!/usr/bin/env python3
+"""
+avocado_report_metrics_v12.py
+
+Generate storage/memory test reports from Avocado job directories, including
+key performance metrics by parsing per-test debug.log files.
+
+This version improves:
+- stdlog prefix stripping (handles continuation lines like "[stdlog]   ...")
+- embedded JSON extraction for "Benchmark results:", "Filesystem test results:",
+  "Application test results:"
+- fio JSON parsing (collect full JSON object even if first line is just "{")
+- kernel fio "✓ Pass N: ..." summary parsing (works with stdlog prefixes)
+"""
+
+from __future__ import annotations
+
 import argparse
 import csv
 import json
 import os
 import re
-import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-# Optional PDF support
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas
-    PDF_AVAILABLE = True
 except Exception:
-    PDF_AVAILABLE = False
+    canvas = None  # type: ignore
 
+
+# ---------------------------- helpers ----------------------------
+
+# Full stdlog prefix: [stdlog] 2026-01-14 21:12:20,986 avocado.test ... INFO | message
+_STDLOG_FULL_RE = re.compile(r"^\[stdlog\]\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d+\s+[^|]+\|\s+")
+# Continuation lines used for pretty-printed JSON blocks: [stdlog]   "k": 1,
+_STDLOG_CONT_RE = re.compile(r"^\[stdlog\]\s+")
+# Some avocado process lines embed [stdout] or [stderr]
+_BRACKET_STDOUT_RE = re.compile(r"\[stdout\]\s*(.*)$")
+_BRACKET_STDERR_RE = re.compile(r"\[stderr\]\s*(.*)$")
+
+
+def strip_stdlog(line: str) -> str:
+    """Remove avocado stdlog prefix, handling both full and continuation lines."""
+    line = line.rstrip("\n")
+    if _STDLOG_FULL_RE.match(line):
+        return _STDLOG_FULL_RE.sub("", line).strip()
+    if _STDLOG_CONT_RE.match(line):
+        # remove just "[stdlog]" and keep rest
+        return _STDLOG_CONT_RE.sub("", line).strip()
+    return line.strip()
+
+
+def read_text_safe(p: Path) -> str:
+    try:
+        return p.read_text(errors="replace")
+    except Exception:
+        return ""
+
+
+def to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def mib_per_s_from_kib_per_s(kib_s: Optional[float]) -> Optional[float]:
+    if kib_s is None:
+        return None
+    return kib_s / 1024.0
+
+
+# ---------------------------- parsing regex ----------------------------
+
+# "✓ Pass 2: 2165.8 MB/s, 202s"
+_RE_PASS_BW = re.compile(r"✓\s*Pass\s*\d+\s*:\s*([0-9]*\.?[0-9]+)\s*(MiB/s|MB/s)", re.IGNORECASE)
+
+# OLTP: "✓ OLTP: 213841 read IOPS, 53454 write IOPS"
+_RE_OLTP = re.compile(r"✓\s*OLTP:\s*([0-9]+)\s*read\s*IOPS,\s*([0-9]+)\s*write\s*IOPS", re.IGNORECASE)
+
+# Mixed: "✓ Mixed 50/50: 244878 R + 244900 W = 489778 total IOPS"
+_RE_MIXED = re.compile(
+    r"✓\s*Mixed\s*50/50:\s*([0-9]+)\s*R\s*\+\s*([0-9]+)\s*W\s*=\s*([0-9]+)\s*total\s*IOPS",
+    re.IGNORECASE,
+)
+
+# SQLite: "✓ SQLite insert rate: 357858.31 rows/s, select: 65.97 ops/s"
+_RE_SQLITE = re.compile(
+    r"✓\s*SQLite\s*insert\s*rate:\s*([0-9]*\.?[0-9]+)\s*rows/s,\s*select:\s*([0-9]*\.?[0-9]+)\s*ops/s",
+    re.IGNORECASE,
+)
+
+# SPDK perf: "PCIE (...) :   20706.96    2588.37    6181.52 ..."
+_RE_SPDK_ROW = re.compile(
+    r"PCIE\s*\([0-9a-fA-F:.]+\)\s*NSID\s*\d+\s*from\s*core\s*\d+\s*:\s*([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)",
+    re.IGNORECASE,
+)
+
+# stress-ng metrc line (we target real-time bogo ops/s column)
+# typical: "metrc: ... iomix ... <bogo ops> <real> <usr> <sys> <bogo ops/s real> <bogo ops/s usr+sys>"
+_RE_STRESSNG_IOMIX = re.compile(r"metrc:.*\biomix\b.*\s([0-9]*\.?[0-9]+)\s*$", re.IGNORECASE)
+
+# FIO JSON signature includes "fio version" and "jobs"
+# We'll collect JSON blocks from stdout stream and then parse.
+
+def _extract_stdout_stream(text: str) -> List[str]:
+    """
+    Extract raw stdout lines (without avocado prefixes) from debug.log.
+    We accept:
+      - process DEBUG lines: "... DEBUG| [stdout] ...."
+      - plain printed stdout lines in debug.log (rare)
+    """
+    out: List[str] = []
+    for raw in text.splitlines():
+        s = raw
+        # Keep original raw for bracket search
+        m = _BRACKET_STDOUT_RE.search(raw)
+        if m:
+            out.append(m.group(1).rstrip())
+            continue
+        # Sometimes stdout lines appear without [stdout] but with stdlog prefix
+        stripped = strip_stdlog(raw)
+        # If it looks like JSON or known tool header, keep it
+        if stripped.startswith("{") or stripped.startswith("fio") or stripped.startswith("stress-ng"):
+            out.append(stripped)
+    return out
+
+
+def _collect_json_objects_from_stream(lines: List[str]) -> List[Dict[str, Any]]:
+    """
+    Collect JSON objects that may span multiple lines.
+    We start collecting when we see a line beginning with '{' and stop when json.loads succeeds.
+    """
+    objs: List[Dict[str, Any]] = []
+    buf: List[str] = []
+    collecting = False
+
+    def try_flush() -> None:
+        nonlocal buf, collecting
+        if not buf:
+            return
+        payload = "\n".join(buf).strip()
+        try:
+            o = json.loads(payload)
+            if isinstance(o, dict):
+                objs.append(o)
+                buf = []
+                collecting = False
+        except Exception:
+            # keep collecting
+            pass
+
+    for line in lines:
+        s = line.strip()
+        if not collecting:
+            if s.startswith("{"):
+                collecting = True
+                buf = [s]
+                try_flush()
+        else:
+            buf.append(s)
+            try_flush()
+
+    return objs
+
+
+def _fio_metrics_from_json(obj: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Pull aggregate fio metrics from fio JSON output.
+    Returns keys:
+      fio_rbw_mib_s, fio_wbw_mib_s, fio_riops, fio_wiops
+    """
+    res: Dict[str, float] = {}
+    jobs = obj.get("jobs")
+    if not isinstance(jobs, list):
+        return res
+
+    rbw_kib = 0.0
+    wbw_kib = 0.0
+    riops = 0.0
+    wiops = 0.0
+
+    for j in jobs:
+        if not isinstance(j, dict):
+            continue
+        r = j.get("read", {})
+        w = j.get("write", {})
+        if isinstance(r, dict):
+            rbw_kib += float(r.get("bw", 0.0) or 0.0)
+            riops += float(r.get("iops", 0.0) or 0.0)
+        if isinstance(w, dict):
+            wbw_kib += float(w.get("bw", 0.0) or 0.0)
+            wiops += float(w.get("iops", 0.0) or 0.0)
+
+    # fio reports bw in KiB/s for JSON
+    if rbw_kib > 0:
+        res["fio_rbw_mib_s"] = rbw_kib / 1024.0
+    if wbw_kib > 0:
+        res["fio_wbw_mib_s"] = wbw_kib / 1024.0
+    if riops > 0:
+        res["fio_riops"] = riops
+    if wiops > 0:
+        res["fio_wiops"] = wiops
+    return res
+
+
+def _extract_embedded_json_block(text: str, marker: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract a pretty-printed JSON object that follows a line containing `marker`,
+    where subsequent lines are prefixed with "[stdlog]".
+    """
+    lines = text.splitlines()
+    for i, raw in enumerate(lines):
+        if marker in raw:
+            # start from this line; everything after the marker may include '{'
+            # Build a JSON payload by stripping stdlog prefixes
+            payload_lines: List[str] = []
+            # get tail of the marker line after marker
+            stripped = strip_stdlog(raw)
+            pos = stripped.find(marker)
+            tail = stripped[pos + len(marker):].strip()
+            if tail:
+                payload_lines.append(tail)
+            # consume following lines until we reach a closing "}" that balances, or blank line after JSON
+            for j in range(i + 1, min(i + 300, len(lines))):
+                s = strip_stdlog(lines[j])
+                if not s:
+                    # allow blank lines after JSON
+                    if payload_lines:
+                        break
+                    continue
+                payload_lines.append(s)
+                # quick stop if line is just "}" and we already started
+                if s == "}" and payload_lines and "{" in "\n".join(payload_lines):
+                    # attempt parse
+                    payload = "\n".join(payload_lines).strip()
+                    try:
+                        return json.loads(payload)
+                    except Exception:
+                        continue
+            # final attempt
+            payload = "\n".join(payload_lines).strip()
+            try:
+                return json.loads(payload)
+            except Exception:
+                return None
+    return None
+
+
+# ---------------------------- data model ----------------------------
 
 @dataclass
 class TestRecord:
     job_id: str
     job_dir: str
-    suite: str            # "storage" or "memory" (heuristic)
+    suite: str
     test_name: str
     status: str
-    duration_s: Optional[float]
-    start_time: Optional[str]
-    end_time: Optional[str]
-    fio_bw_kib: Optional[float] = None
-    fio_iops: Optional[float] = None
+    duration_s: float
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    # metrics
     spdk_iops: Optional[float] = None
-    spdk_mb_s: Optional[float] = None
-    error_tail: str = ""
+    spdk_mib_s: Optional[float] = None
+    spdk_lat_us: Optional[float] = None
+    fio_rbw_mib_s: Optional[float] = None
+    fio_wbw_mib_s: Optional[float] = None
+    fio_riops: Optional[float] = None
+    fio_wiops: Optional[float] = None
+    tps: Optional[float] = None
+    eps: Optional[float] = None
+    p50_us: Optional[float] = None
+    p99_us: Optional[float] = None
 
 
-STATUS_RE = re.compile(r"^\s*\(\d+/\d+\)\s+(?P<test>.+?):\s+(?P<status>PASS|FAIL|ERROR|CANCEL|SKIP|WARN|INTERRUPT)\s*(?:\((?P<dur>[\d.]+)\s*s\))?\s*$")
-START_RE = re.compile(r"^\s*\(\d+/\d+\)\s+(?P<test>.+?):\s+STARTED\s*$")
+# ---------------------------- avocado results.json ----------------------------
+
+def parse_results_json(job_dir: Path) -> Tuple[str, List[Dict[str, Any]]]:
+    rj = job_dir / "results.json"
+    obj = json.loads(read_text_safe(rj) or "{}")
+    job_id = obj.get("job_id") or job_dir.name
+    tests = obj.get("tests") or []
+    if not isinstance(tests, list):
+        tests = []
+    return str(job_id), tests
 
 
-def guess_suite(test_name: str) -> str:
-    t = test_name.lower()
-    if "dimm" in t or "memory" in t:
+def classify_suite(test_name: str) -> str:
+    # simple heuristic
+    low = test_name.lower()
+    if "dimm" in low or "memory" in low:
         return "memory"
-    if "storage" in t or "nvme" in t or "spdk" in t or "fio" in t:
+    if "storage" in low or "nvme" in low or "spdk" in low or "fio" in low:
         return "storage"
-    # fallback: class names often include StorageKernelTests / DIMMTests etc.
-    if "storage" in test_name:
-        return "storage"
-    return "memory"  # conservative default
+    return "other"
 
 
-def find_jobs(job_root: Path, limit: int = 20) -> List[Path]:
-    if not job_root.exists():
-        return []
-    jobs = sorted([p for p in job_root.glob("job-*") if p.is_dir()],
-                  key=lambda p: p.stat().st_mtime, reverse=True)
-    return jobs[:limit]
+def find_debug_log(job_dir: Path, test_entry: Dict[str, Any]) -> Optional[Path]:
+    # Prefer explicit logfile path from results.json
+    lf = test_entry.get("logfile")
+    if isinstance(lf, str) and lf:
+        p = Path(lf)
+        if p.exists():
+            return p
+    # Fallback: find under test-results by id
+    tid = test_entry.get("id")
+    if isinstance(tid, str) and tid:
+        # id is like "01-storage_test_suite.py:Class.test"
+        # directory is "01-storage_test_suite.py_Class.test"
+        tr = job_dir / "test-results"
+        if tr.exists():
+            for d in tr.iterdir():
+                if d.is_dir() and tid.split(":", 1)[0] in d.name and d.name.endswith(test_entry.get("name", "").replace(":", "_")):
+                    cand = d / "debug.log"
+                    if cand.exists():
+                        return cand
+            # more robust: look for matching name substring
+            name = test_entry.get("name", "")
+            for d in tr.iterdir():
+                if d.is_dir() and name and name.replace(":", "_") in d.name:
+                    cand = d / "debug.log"
+                    if cand.exists():
+                        return cand
+    return None
 
 
-def read_text(path: Path, max_bytes: int = 2_000_000) -> str:
-    try:
-        data = path.read_bytes()
-        if len(data) > max_bytes:
-            data = data[-max_bytes:]
-        return data.decode(errors="replace")
-    except Exception:
-        return ""
+# ---------------------------- per-test metric parsing ----------------------------
+
+def parse_metrics_from_debuglog(test_name: str, debug_text: str) -> Dict[str, float]:
+    m: Dict[str, float] = {}
+
+    # 1) SPDK perf: find last Total line row with PCIE
+    spdk_rows = []
+    for raw in debug_text.splitlines():
+        # parse from stdout lines too
+        stripped = strip_stdlog(raw)
+        mo = _RE_SPDK_ROW.search(stripped)
+        if mo:
+            spdk_rows.append((float(mo.group(1)), float(mo.group(2)), float(mo.group(3))))
+    if spdk_rows:
+        iops, mib_s, lat = spdk_rows[-1]
+        m["spdk_iops"] = iops
+        m["spdk_mib_s"] = mib_s
+        m["spdk_lat_us"] = lat
+
+    # 2) checkmark BW summaries (kernel full disk + some benchmarks)
+    # Use average across passes if multiple
+    bws: List[float] = []
+    for raw in debug_text.splitlines():
+        s = strip_stdlog(raw)
+        mo = _RE_PASS_BW.search(s)
+        if mo:
+            bws.append(float(mo.group(1)))
+    if bws:
+        avg = sum(bws) / len(bws)
+        # Decide whether read or write based on test name
+        if "read" in test_name.lower():
+            m["fio_rbw_mib_s"] = avg
+        elif "write" in test_name.lower():
+            m["fio_wbw_mib_s"] = avg
+
+    # 3) OLTP / Mixed summary
+    for raw in debug_text.splitlines():
+        s = strip_stdlog(raw)
+        mo = _RE_OLTP.search(s)
+        if mo:
+            m["fio_riops"] = float(mo.group(1))
+            m["fio_wiops"] = float(mo.group(2))
+        mo2 = _RE_MIXED.search(s)
+        if mo2:
+            m["fio_riops"] = float(mo2.group(1))
+            m["fio_wiops"] = float(mo2.group(2))
+
+    # 4) SQLite
+    for raw in debug_text.splitlines():
+        s = strip_stdlog(raw)
+        mo = _RE_SQLITE.search(s)
+        if mo:
+            m["tps"] = float(mo.group(1))
+            m["eps"] = float(mo.group(2))
+
+    # 5) Embedded JSON blocks
+    bench = _extract_embedded_json_block(debug_text, "Benchmark results:")
+    if isinstance(bench, dict):
+        lp = bench.get("latency_percentiles")
+        if isinstance(lp, dict):
+            # Prefer 50th_us / 99th_us
+            p50 = lp.get("50th_us")
+            p99 = lp.get("99th_us")
+            if isinstance(p50, (int, float)):
+                m["p50_us"] = float(p50)
+            if isinstance(p99, (int, float)):
+                m["p99_us"] = float(p99)
+
+    fs = _extract_embedded_json_block(debug_text, "Filesystem test results:")
+    if isinstance(fs, dict):
+        fv = fs.get("fio_file_verify")
+        if isinstance(fv, dict):
+            jpath = fv.get("json")
+            if isinstance(jpath, str) and jpath:
+                jp = Path(jpath)
+                if jp.exists():
+                    try:
+                        fio_obj = json.loads(read_text_safe(jp) or "{}")
+                        m.update(_fio_metrics_from_json(fio_obj))
+                    except Exception:
+                        pass
+
+    app = _extract_embedded_json_block(debug_text, "Application test results:")
+    if isinstance(app, dict):
+        # if suite ever emits app results json, optional
+        pass
+
+    # 6) stress-ng iomix bogo ops/s (real time) -> eps
+    # We'll look for the metrc line that includes iomix and ends with a number
+    for raw in debug_text.splitlines():
+        s = strip_stdlog(raw)
+        if "metrc:" in s and "iomix" in s:
+            # last float on line is often bogo ops/s (usr+sys). Prefer real time column if present.
+            # We'll capture the last number as EPS (good enough signal).
+            nums = re.findall(r"([0-9]*\.?[0-9]+)", s)
+            if nums:
+                m["eps"] = float(nums[-2]) if len(nums) >= 2 else float(nums[-1])
+                # In many builds: ... real time ... usr+sys ; choose real time (second last) when possible
+                break
+
+    # 7) Generic fio JSON parsing from stdout stream (covers sweeps, random tests)
+    stdout_lines = _extract_stdout_stream(debug_text)
+    fio_jsons = _collect_json_objects_from_stream(stdout_lines)
+    # take the last fio JSON object that has "jobs"
+    for obj in reversed(fio_jsons):
+        if isinstance(obj, dict) and "jobs" in obj:
+            m.update(_fio_metrics_from_json(obj))
+            break
+
+    return m
 
 
-def parse_job_log(job_dir: Path) -> List[TestRecord]:
-    """Parse job.log lines like '(08/16) ...: PASS (12.34 s)'."""
-    job_log = job_dir / "job.log"
-    txt = read_text(job_log)
-    if not txt:
-        return []
-
-    job_id = job_dir.name
-    records: Dict[str, TestRecord] = {}
-    start_seen: Dict[str, str] = {}
-
-    # Try to extract a coarse job start/end time from log headers (best-effort)
-    # Avocado job.log typically includes timestamps in lines; we keep per-test times None for now.
-    for line in txt.splitlines():
-        mstart = START_RE.match(line)
-        if mstart:
-            tname = mstart.group("test").strip()
-            start_seen[tname] = start_seen.get(tname, "")
-            # We can’t reliably parse exact timestamps from this short line alone.
-
-        m = STATUS_RE.match(line)
-        if not m:
-            continue
-        tname = m.group("test").strip()
-        status = m.group("status").strip()
-        dur = m.group("dur")
-        dur_s = float(dur) if dur else None
-        suite = guess_suite(tname)
-
-        records[tname] = TestRecord(
-            job_id=job_id,
-            job_dir=str(job_dir),
-            suite=suite,
-            test_name=tname,
-            status=status,
-            duration_s=dur_s,
-            start_time=None,
-            end_time=None,
-        )
-
-    # Attach error tails from per-test debug.log when not PASS
-    for tname, rec in records.items():
-        if rec.status == "PASS":
-            continue
-        debug = find_debug_log(job_dir, tname)
-        if debug:
-            tail = tail_lines(read_text(debug), 60)
-            rec.error_tail = tail
-
-        # parse metrics for both PASS and non-PASS if logs exist
-        debug2 = debug or find_debug_log(job_dir, tname)
-        if debug2:
-            apply_perf_parsing(rec, read_text(debug2))
-
-    return list(records.values())
-
-
-def find_debug_log(job_dir: Path, test_name: str) -> Optional[Path]:
-    """Find matching test-results/*/debug.log by substring heuristics."""
-    tr = job_dir / "test-results"
-    if not tr.exists():
-        return None
-    # Prefer exact-ish match
-    candidates = []
-    for d in tr.iterdir():
-        if not d.is_dir():
-            continue
-        dbg = d / "debug.log"
-        if not dbg.exists():
-            continue
-        # directory names often include the test name sanitized; use substring matching
-        if sanitize(test_name) in d.name or test_name.split(":")[-1] in d.name:
-            candidates.append(dbg)
-    if candidates:
-        # pick newest
-        return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-
-    # fallback: just return any debug.log (not great)
-    all_dbg = list(tr.glob("*/debug.log"))
-    if not all_dbg:
-        return None
-    return sorted(all_dbg, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-
-
-def sanitize(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
-
-
-def tail_lines(text: str, n: int) -> str:
-    lines = text.splitlines()
-    return "\n".join(lines[-n:])
-
-
-def apply_perf_parsing(rec: TestRecord, debug_text: str) -> None:
-    """
-    Best-effort parsing:
-    - fio: looks for 'READ:' or 'WRITE:' lines containing IOPS= and BW=
-    - spdk_nvme_perf: looks for 'IOPS' and 'MB/s' patterns
-    """
-    # fio sample: READ: bw=123MiB/s (129MB/s), 31.5k IOPS
-    fio_bw = None
-    fio_iops = None
-
-    # more general fio regexes
-    fio_line_re = re.compile(r"\b(READ|WRITE):.*?\bIOPS=([0-9.]+)([kKmM]?)\b.*?\bbw=([0-9.]+)\s*([KMG]iB/s|[KMG]B/s)\b")
-    for line in debug_text.splitlines():
-        m = fio_line_re.search(line)
-        if m:
-            iops_val = float(m.group(2))
-            iops_suffix = m.group(3).lower()
-            if iops_suffix == "k":
-                iops_val *= 1_000
-            elif iops_suffix == "m":
-                iops_val *= 1_000_000
-            fio_iops = iops_val
-
-            bw_val = float(m.group(4))
-            bw_unit = m.group(5)
-            # Convert to KiB/s
-            mult = 1.0
-            if "KiB/s" in bw_unit:
-                mult = 1.0
-            elif "MiB/s" in bw_unit:
-                mult = 1024.0
-            elif "GiB/s" in bw_unit:
-                mult = 1024.0 * 1024.0
-            elif "KB/s" in bw_unit:
-                mult = 1000.0 / 1024.0
-            elif "MB/s" in bw_unit:
-                mult = 1000.0 * 1000.0 / 1024.0
-            elif "GB/s" in bw_unit:
-                mult = 1000.0 * 1000.0 * 1000.0 / 1024.0
-            fio_bw = bw_val * mult
-
-    # SPDK perf patterns (varies by version)
-    spdk_iops = None
-    spdk_mb_s = None
-    spdk_iops_re = re.compile(r"\bIOPS[:=]?\s*([0-9.]+)\s*([kKmM]?)\b")
-    spdk_mb_re = re.compile(r"\bMB/s[:=]?\s*([0-9.]+)\b")
-    for line in debug_text.splitlines():
-        mi = spdk_iops_re.search(line)
-        if mi:
-            val = float(mi.group(1))
-            suf = mi.group(2).lower()
-            if suf == "k":
-                val *= 1_000
-            elif suf == "m":
-                val *= 1_000_000
-            spdk_iops = val
-        mm = spdk_mb_re.search(line)
-        if mm:
-            spdk_mb_s = float(mm.group(1))
-
-    rec.fio_bw_kib = fio_bw
-    rec.fio_iops = fio_iops
-    rec.spdk_iops = spdk_iops
-    rec.spdk_mb_s = spdk_mb_s
-
+# ---------------------------- reporting ----------------------------
 
 def write_csv(path: Path, rows: List[TestRecord]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
+    with path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "job_id", "job_dir", "suite", "test_name", "status", "duration_s",
-            "start_time", "end_time",
-            "fio_bw_kib_s", "fio_iops", "spdk_iops", "spdk_mb_s",
-            "error_tail"
+            "job_id","job_dir","suite","test_name","status","duration_s",
+            "spdk_iops","spdk_mib_s","spdk_lat_us",
+            "fio_rbw_mib_s","fio_wbw_mib_s","fio_riops","fio_wiops",
+            "tps","eps","p50_us","p99_us"
         ])
         for r in rows:
             w.writerow([
-                r.job_id, r.job_dir, r.suite, r.test_name, r.status, r.duration_s,
-                r.start_time, r.end_time,
-                r.fio_bw_kib, r.fio_iops, r.spdk_iops, r.spdk_mb_s,
-                r.error_tail
+                r.job_id,r.job_dir,r.suite,r.test_name,r.status,f"{r.duration_s:.6f}",
+                r.spdk_iops,r.spdk_mib_s,r.spdk_lat_us,
+                r.fio_rbw_mib_s,r.fio_wbw_mib_s,r.fio_riops,r.fio_wiops,
+                r.tps,r.eps,r.p50_us,r.p99_us
             ])
 
 
-def write_text_report(path: Path, rows: List[TestRecord], title: str) -> None:
+def fmt(x: Optional[float], nd: int = 2) -> str:
+    if x is None:
+        return "-"
+    return f"{x:.{nd}f}"
+
+
+def write_txt(path: Path, rows: List[TestRecord], title: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    total = len(rows)
-    by_status: Dict[str, int] = {}
+    status_counts: Dict[str, int] = {}
     for r in rows:
-        by_status[r.status] = by_status.get(r.status, 0) + 1
+        status_counts[r.status] = status_counts.get(r.status, 0) + 1
 
-    lines = []
-    lines.append(f"{title}")
-    lines.append(f"Generated: {datetime.now().isoformat(timespec='seconds')}")
-    lines.append(f"Total tests: {total}")
-    lines.append("Status counts: " + ", ".join(f"{k}={v}" for k, v in sorted(by_status.items())))
-    lines.append("")
-
-    # Fail/CANCEL detail first
-    bad = [r for r in rows if r.status != "PASS"]
-    if bad:
-        lines.append("Non-PASS tests:")
-        for r in bad:
-            lines.append(f"- {r.status:7s}  {r.test_name}  (job={r.job_id})  dur={r.duration_s}")
-        lines.append("")
-
-        for r in bad:
-            lines.append("=" * 80)
-            lines.append(f"{r.status} :: {r.test_name}")
-            lines.append(f"Job: {r.job_id}")
-            if r.fio_iops or r.fio_bw_kib or r.spdk_iops or r.spdk_mb_s:
-                lines.append("Metrics:")
-                if r.fio_bw_kib:
-                    lines.append(f"  fio_bw_kib_s: {r.fio_bw_kib:.1f}")
-                if r.fio_iops:
-                    lines.append(f"  fio_iops: {r.fio_iops:.1f}")
-                if r.spdk_iops:
-                    lines.append(f"  spdk_iops: {r.spdk_iops:.1f}")
-                if r.spdk_mb_s:
-                    lines.append(f"  spdk_mb_s: {r.spdk_mb_s:.1f}")
-            if r.error_tail:
-                lines.append("")
-                lines.append("debug.log tail:")
-                lines.append(r.error_tail)
-            lines.append("")
-
-    # PASS summary with top perf if available
-    perf = [r for r in rows if r.status == "PASS" and (r.fio_iops or r.spdk_iops)]
-    if perf:
-        lines.append("")
-        lines.append("Top performance (best-effort parsed):")
-        # sort by whichever is present
-        perf_sorted = sorted(perf, key=lambda r: (r.spdk_iops or 0, r.fio_iops or 0), reverse=True)[:10]
-        for r in perf_sorted:
-            lines.append(
-                f"- {r.test_name}  fio_iops={r.fio_iops} fio_bw_kib_s={r.fio_bw_kib}  "
-                f"spdk_iops={r.spdk_iops} spdk_mb_s={r.spdk_mb_s}"
+    with path.open("w") as f:
+        f.write(f"{title}\n")
+        f.write(f"Generated: {datetime.now().isoformat(timespec='seconds')}\n")
+        f.write(f"Total tests: {len(rows)}\n")
+        if status_counts:
+            f.write("Status counts: " + ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items())) + "\n")
+        f.write("\n")
+        header = (
+            "STATUS  DUR(s)  SPDK_IOPS  SPDK_MiB/s  SPDK_lat(us)  "
+            "FIO_RBW(MiB/s)  FIO_WBW(MiB/s)  FIO_RIOPS  FIO_WIOPS   "
+            "TPS     EPS   P50(us)  P99(us)  TEST"
+        )
+        f.write(header + "\n")
+        f.write("-" * len(header) + "\n")
+        for r in rows:
+            f.write(
+                f"{r.status:<6} {r.duration_s:>7.3f} "
+                f"{fmt(r.spdk_iops,2):>9} {fmt(r.spdk_mib_s,2):>11} {fmt(r.spdk_lat_us,2):>12} "
+                f"{fmt(r.fio_rbw_mib_s,2):>13} {fmt(r.fio_wbw_mib_s,2):>13} "
+                f"{fmt(r.fio_riops,0):>9} {fmt(r.fio_wiops,0):>9} "
+                f"{fmt(r.tps,2):>7} {fmt(r.eps,2):>7} "
+                f"{fmt(r.p50_us,3):>7} {fmt(r.p99_us,3):>7}  "
+                f"{r.test_name}\n"
             )
-
-    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def write_pdf(path: Path, rows: List[TestRecord], title: str) -> None:
-    if not PDF_AVAILABLE:
+    if canvas is None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     c = canvas.Canvas(str(path), pagesize=letter)
     width, height = letter
+    y = height - 50
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(50, y, title)
+    y -= 18
+    c.setFont("Helvetica", 10)
+    c.drawString(50, y, f"Generated: {datetime.now().isoformat(timespec='seconds')}")
+    y -= 22
 
-    def draw_line(y: float, text: str, size: int = 10) -> float:
-        c.setFont("Helvetica", size)
-        c.drawString(40, y, text[:120])
-        return y - (size + 2)
-
-    y = height - 40
-    y = draw_line(y, title, 14)
-    y = draw_line(y, f"Generated: {datetime.now().isoformat(timespec='seconds')}", 10)
-    y -= 10
-
-    total = len(rows)
-    by_status: Dict[str, int] = {}
+    cols = ["STATUS","DUR(s)","SPDK_IOPS","SPDK_MiB/s","FIO_RBW","FIO_WBW","RIOPS","WIOPS","TPS","EPS","P50us","P99us","TEST"]
+    colw = [50,55,70,70,55,55,45,45,45,45,45,45, 250]
+    c.setFont("Helvetica-Bold", 8)
+    x = 50
+    for w, name in zip(colw, cols):
+        c.drawString(x, y, name)
+        x += w
+    y -= 12
+    c.setFont("Helvetica", 7)
     for r in rows:
-        by_status[r.status] = by_status.get(r.status, 0) + 1
-    y = draw_line(y, f"Total tests: {total}", 10)
-    y = draw_line(y, "Status: " + ", ".join(f"{k}={v}" for k, v in sorted(by_status.items())), 10)
-    y -= 10
-
-    bad = [r for r in rows if r.status != "PASS"]
-    y = draw_line(y, f"Non-PASS tests: {len(bad)}", 11)
-    for r in bad[:25]:
-        if y < 80:
+        if y < 60:
             c.showPage()
-            y = height - 40
-        y = draw_line(y, f"{r.status:7s} {r.test_name} (job={r.job_id})", 9)
-
-    c.showPage()
-    y = height - 40
-    y = draw_line(y, "Failure details (debug.log tail excerpts)", 12)
-    for r in bad[:10]:
-        if y < 120:
-            c.showPage()
-            y = height - 40
-        y = draw_line(y, f"{r.status} :: {r.test_name}", 10)
-        y = draw_line(y, f"Job: {r.job_id}", 9)
-        if r.error_tail:
-            for line in r.error_tail.splitlines()[-25:]:
-                if y < 80:
-                    c.showPage()
-                    y = height - 40
-                y = draw_line(y, line, 7)
-        y -= 8
-
+            y = height - 50
+            c.setFont("Helvetica-Bold", 8)
+            x = 50
+            for w, name in zip(colw, cols):
+                c.drawString(x, y, name)
+                x += w
+            y -= 12
+            c.setFont("Helvetica", 7)
+        vals = [
+            r.status,
+            f"{r.duration_s:.1f}",
+            fmt(r.spdk_iops,0),
+            fmt(r.spdk_mib_s,1),
+            fmt(r.fio_rbw_mib_s,1),
+            fmt(r.fio_wbw_mib_s,1),
+            fmt(r.fio_riops,0),
+            fmt(r.fio_wiops,0),
+            fmt(r.tps,1),
+            fmt(r.eps,1),
+            fmt(r.p50_us,1),
+            fmt(r.p99_us,1),
+            r.test_name,
+        ]
+        x = 50
+        for w, v in zip(colw, vals):
+            c.drawString(x, y, str(v)[:40])
+            x += w
+        y -= 10
     c.save()
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Collect Avocado job results into storage/memory reports (CSV/TXT/PDF).")
-    ap.add_argument("--job-root", default=str(Path.home() / "avocado" / "job-results"),
-                    help="Path to avocado job-results directory (default: ~/avocado/job-results)")
-    ap.add_argument("--out-dir", default="reports", help="Output directory")
-    ap.add_argument("--jobs", type=int, default=10, help="How many newest jobs to scan")
-    ap.add_argument("--no-pdf", action="store_true", help="Disable PDF output")
+# ---------------------------- main ----------------------------
+
+def list_recent_jobs(job_root: Path, n: int) -> List[Path]:
+    jobs = [p for p in job_root.glob("job-*") if p.is_dir()]
+    jobs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return jobs[:n]
+
+
+def build_records_for_job(job_dir: Path, debug: bool=False) -> List[TestRecord]:
+    job_id, tests = parse_results_json(job_dir)
+    rows: List[TestRecord] = []
+    for t in tests:
+        name = t.get("name") or ""
+        status = t.get("status") or "UNKNOWN"
+        dur = float(t.get("time_elapsed") or 0.0)
+        suite = classify_suite(name)
+        rec = TestRecord(
+            job_id=str(job_id),
+            job_dir=str(job_dir),
+            suite=suite,
+            test_name=str(name),
+            status=str(status),
+            duration_s=dur,
+            start_time=to_float(t.get("actual_time_start")),
+            end_time=to_float(t.get("actual_time_end")),
+        )
+        dbg = find_debug_log(job_dir, t)
+        if dbg and dbg.exists():
+            text = read_text_safe(dbg)
+            metrics = parse_metrics_from_debuglog(rec.test_name, text)
+            for k, v in metrics.items():
+                setattr(rec, k, v)
+            if debug and not metrics:
+                print(f"[debug] no metrics parsed for: {rec.test_name}")
+        else:
+            if debug:
+                print(f"[debug] missing debug.log for: {rec.test_name}")
+        rows.append(rec)
+    return rows
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--job-dir", type=str, default="", help="Specific Avocado job directory to parse")
+    ap.add_argument("--job-root", type=str, default="/home/ubuntu/avocado/job-results", help="Root directory containing job-* dirs")
+    ap.add_argument("--jobs", type=int, default=1, help="Number of most recent jobs to scan (ignored if --job-dir set)")
+    ap.add_argument("--min-tests", type=int, default=2, help="Ignore jobs with fewer than this many tests (only in --jobs mode)")
+    ap.add_argument("--out-dir", type=str, default="./reports", help="Output directory")
+    ap.add_argument("--debug", action="store_true", help="Debug logging")
     args = ap.parse_args()
 
-    job_root = Path(args.job_root).expanduser()
     out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    jobs = find_jobs(job_root, limit=args.jobs)
-    if not jobs:
-        print(f"No Avocado jobs found under: {job_root}", file=sys.stderr)
-        sys.exit(2)
+    job_dirs: List[Path] = []
+    if args.job_dir:
+        job_dirs = [Path(args.job_dir)]
+    else:
+        job_dirs = list_recent_jobs(Path(args.job_root), args.jobs)
 
     all_rows: List[TestRecord] = []
-    for job in jobs:
-        rows = parse_job_log(job)
-        all_rows.extend(rows)
+    for jd in job_dirs:
+        try:
+            job_id, tests = parse_results_json(jd)
+            if not args.job_dir and len(tests) < args.min_tests:
+                if args.debug:
+                    print(f"[debug] {jd.name}: ignored (tests={len(tests)} < min_tests={args.min_tests})")
+                continue
+            rows = build_records_for_job(jd, debug=args.debug)
+            all_rows.extend(rows)
+            if args.debug:
+                print(f"[debug] {jd.name}: parsed {len(rows)} tests from results.json (raw tests={len(tests)})")
+        except Exception as e:
+            if args.debug:
+                print(f"[debug] failed job {jd}: {e}")
 
+    # split by suite
     storage = [r for r in all_rows if r.suite == "storage"]
     memory = [r for r in all_rows if r.suite == "memory"]
 
-    # Write reports
     write_csv(out_dir / "storage_report.csv", storage)
-    write_text_report(out_dir / "storage_report.txt", storage, "Storage Test Report")
-    write_csv(out_dir / "memory_report.csv", memory)
-    write_text_report(out_dir / "memory_report.txt", memory, "Memory (DIMM) Test Report")
+    write_txt(out_dir / "storage_report.txt", storage, "Storage Test Report")
+    write_pdf(out_dir / "storage_report.pdf", storage, "Storage Test Report")
 
-    if not args.no_pdf and PDF_AVAILABLE:
-        write_pdf(out_dir / "storage_report.pdf", storage, "Storage Test Report")
-        write_pdf(out_dir / "memory_report.pdf", memory, "Memory (DIMM) Test Report")
+    write_csv(out_dir / "memory_report.csv", memory)
+    write_txt(out_dir / "memory_report.txt", memory, "Memory (DIMM) Test Report")
+    write_pdf(out_dir / "memory_report.pdf", memory, "Memory (DIMM) Test Report")
 
     print(f"Wrote reports to: {out_dir.resolve()}")
-    if not PDF_AVAILABLE and not args.no_pdf:
-        print("Note: PDF not generated (reportlab not installed in this environment). Use --no-pdf to silence.")
 
 
 if __name__ == "__main__":
     main()
-

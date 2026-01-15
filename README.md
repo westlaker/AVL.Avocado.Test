@@ -132,10 +132,12 @@ Example usage
 
 ```text
 1) Generate reports from the last 10 jobs
-python3 avocado_report.py --jobs 10 --out-dir ./final_reports
+python3 avocado_report.py --jobs 10 --out-dir ./reports --debug
+python3 avocado_report.py --jobs 2 --latest-per-suite --out-dir ./reports --debug
+python3 avocado_report.py --job-root /home/ubuntu/avocado/job-results --out-dir ./reports
 
-2) Point at a specific job-results root
-python3 avocado_report.py --job-root /home/ubuntu/avocado/job-results --out-dir ./final_reports
+2) Point at a specific job-results root for job-id e.g. job-2026-01-14T19.54-4b8f791
+python3 avocado_report_metrics_v12.py   --job-dir /home/ubuntu/avocado/job-results/job-2026-01-14T19.54-4b8f791   --min-tests 1   --out-dir ./reports   --debug
 ```
 
 Output files
